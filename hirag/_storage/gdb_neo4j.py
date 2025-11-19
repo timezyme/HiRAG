@@ -1,5 +1,7 @@
 import json
 import asyncio
+import networkx as nx
+import re
 from collections import defaultdict
 from neo4j import AsyncGraphDatabase
 from dataclasses import dataclass
@@ -15,6 +17,21 @@ def make_path_idable(path):
     return path.replace(".", "_").replace("/", "__").replace("-", "_")
 
 
+def _sanitize_label(raw_label: str) -> str:
+    """Ensure dynamic labels comply with Neo4j naming rules."""
+    if not raw_label:
+        return "UNKNOWN"
+    label = raw_label.strip().replace(" ", "_")
+    label = re.sub(r"[^0-9A-Za-z_]", "_", label)
+    label = re.sub(r"_+", "_", label)
+    label = label.strip("_")
+    if not label:
+        return "UNKNOWN"
+    if label[0].isdigit():
+        label = f"_{label}"
+    return label.upper()
+
+
 @dataclass
 class Neo4jStorage(BaseGraphStorage):
     def __post_init__(self):
@@ -24,10 +41,20 @@ class Neo4jStorage(BaseGraphStorage):
             f"{make_path_idable(self.global_config['working_dir'])}__{self.namespace}"
         )
         logger.info(f"Using the label {self.namespace} for Neo4j as identifier")
-        if self.neo4j_url is None or self.neo4j_auth is None:
-            raise ValueError("Missing neo4j_url or neo4j_auth in addon_params")
+        if self.neo4j_url is None:
+            raise ValueError("Missing neo4j_url in addon_params")
+        
+        # Handle authentication - convert list to tuple if needed
+        if self.neo4j_auth is None:
+            auth_param = None
+        elif isinstance(self.neo4j_auth, list) and len(self.neo4j_auth) == 2:
+            # Convert list to tuple for Neo4j driver
+            auth_param = (self.neo4j_auth[0], self.neo4j_auth[1])
+        else:
+            auth_param = self.neo4j_auth
+            
         self.async_driver = AsyncGraphDatabase.driver(
-            self.neo4j_url, auth=self.neo4j_auth
+            self.neo4j_url, auth=auth_param
         )
 
     # async def create_database(self):
@@ -161,7 +188,7 @@ class Neo4jStorage(BaseGraphStorage):
             return edges
 
     async def upsert_node(self, node_id: str, node_data: dict[str, str]):
-        node_type = node_data.get("entity_type", "UNKNOWN").strip('"')
+        node_type = _sanitize_label(node_data.get("entity_type", "UNKNOWN").strip('"'))
         async with self.async_driver.session() as session:
             await session.run(
                 f"MERGE (n:{self.namespace}:{node_type} {{id: $node_id}}) "
@@ -310,6 +337,22 @@ class Neo4jStorage(BaseGraphStorage):
 
         return dict(results)
 
+    async def shortest_path(self, source: str, target: str) -> list:
+        async with self.async_driver.session() as session:
+            result = await session.run(
+                f"""
+                MATCH path = shortestPath((source:{self.namespace} {{id: $source}})-[*]-(target:{self.namespace} {{id: $target}}))
+                RETURN [node in nodes(path) | node.id] as path_nodes
+                """,
+                source=source,
+                target=target
+            )
+            record = await result.single()
+            if record and record["path_nodes"]:
+                return record["path_nodes"]
+            else:
+                raise nx.NetworkXNoPath(f"No path between {source} and {target}")
+
     async def index_done_callback(self):
         await self.async_driver.close()
 
@@ -328,3 +371,22 @@ class Neo4jStorage(BaseGraphStorage):
             except Exception as e:
                 logger.error(f"Error deleting nodes and edges: {str(e)}")
                 raise
+
+    async def subgraph_edges(self, nodes: list) -> list:
+        """obtain the edge list of the subgraph of the specified nodes"""
+        if not nodes:
+            return []
+            
+        async with self.async_driver.session() as session:
+            result = await session.run(
+                f"""
+                MATCH (n:{self.namespace})-[r]-(m:{self.namespace})
+                WHERE n.id IN $node_ids AND m.id IN $node_ids
+                RETURN n.id as source, m.id as target, r.weight as weight
+                """,
+                node_ids=nodes
+            )
+            edges = []
+            async for record in result:
+                edges.append((record["source"], record["target"], record.get("weight", 0.0)))
+            return edges
